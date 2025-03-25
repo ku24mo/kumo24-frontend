@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { createClient } from '@supabase/supabase-js';
+import { S3Client, GetBucketAclCommand, GetBucketPolicyCommand } from '@aws-sdk/client-s3';
 
 const algorithm = 'aes-256-cbc';
 const secretKey = process.env.SECRET_KEY;
@@ -19,6 +20,55 @@ function encrypt(text) {
   };
 }
 
+function decrypt(encrypted) {
+  const decipher = crypto.createDecipheriv(
+    algorithm,
+    Buffer.from(secretKey, 'hex'),
+    Buffer.from(encrypted.iv, 'hex')
+  );
+  let decrypted = decipher.update(Buffer.from(encrypted.content, 'hex'));
+  decrypted = Buffer.concat([decrypted, decipher.final()]);
+  return decrypted.toString();
+}
+
+async function runScan({ accessKeyId, secretAccessKey, region, bucketName }) {
+  const client = new S3Client({
+    region,
+    forcePathStyle: false,
+    endpoint: `https://s3.${region}.amazonaws.com`,
+    credentials: {
+      accessKeyId,
+      secretAccessKey
+    }
+  });
+
+  try {
+    const aclRes = await client.send(new GetBucketAclCommand({ Bucket: bucketName }));
+    const policyRes = await client.send(new GetBucketPolicyCommand({ Bucket: bucketName }));
+
+    let risk = 'low';
+    const grants = aclRes.Grants || [];
+    const policy = JSON.parse(policyRes.Policy || '{}');
+
+    if (
+      grants.some(g => g.Grantee?.URI?.includes('AllUsers')) ||
+      JSON.stringify(policy).includes('"Principal":"*"')
+    ) {
+      risk = 'public';
+    }
+
+    return {
+      bucket: bucketName,
+      acl: aclRes,
+      policy,
+      risk_level: risk
+    };
+  } catch (err) {
+    console.error('Scan failed:', err);
+    throw new Error('Error scanning bucket');
+  }
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ message: 'Method not allowed' });
@@ -34,10 +84,10 @@ export default async function handler(req, res) {
     const encryptedAccessKey = encrypt(accessKey);
     const encryptedSecretKey = encrypt(awsSecretKey);
 
-    // TEMP USER ID placeholder — we'll replace with real user auth later
     const user_id = 'test-user-123';
 
-    const { error } = await supabase.from('aws_credentials').insert([
+    // 1. Save encrypted credentials
+    const { error: insertError } = await supabase.from('aws_credentials').insert([
       {
         user_id,
         region,
@@ -46,11 +96,32 @@ export default async function handler(req, res) {
       }
     ]);
 
-    if (error) throw error;
+    if (insertError) throw insertError;
 
-    return res.status(200).json({ message: 'Credentials encrypted and stored in Supabase' });
+    // 2. Decrypt credentials for scanning
+    const accessKeyId = decrypt(encryptedAccessKey);
+    const secretAccessKey = decrypt(encryptedSecretKey);
+
+    // 3. Run scan
+    const result = await runScan({ accessKeyId, secretAccessKey, region, bucketName: 'kumo24-test-bucket' });
+
+    // 4. Save scan result
+    const { error: scanInsertError } = await supabase.from('scan_results').insert([
+      {
+        user_id,
+        region,
+        bucket: result.bucket,
+        acl: result.acl,
+        policy: result.policy,
+        risk_level: result.risk_level
+      }
+    ]);
+
+    if (scanInsertError) throw scanInsertError;
+
+    return res.status(200).json({ message: 'Credentials saved and scan completed', scan: result });
   } catch (err) {
     console.error('Save error:', err);
-    return res.status(500).json({ message: 'Server error' });
+    return res.status(500).json({ message: 'Server error', error: err.message });
   }
 }
